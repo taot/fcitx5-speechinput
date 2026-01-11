@@ -5,20 +5,30 @@ Designed for Linux systems with PipeWire/PulseAudio.
 """
 
 import sys
+from typing import Any, cast
+
 import numpy as np
 import sounddevice as sd
 import pulsectl
 
 from PySide6.QtCore import Qt, QTimer, Signal, QObject
 from PySide6.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-    QComboBox, QPushButton, QSlider, QLabel, QMessageBox
+    QApplication,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QComboBox,
+    QPushButton,
+    QSlider,
+    QLabel,
+    QMessageBox,
 )
 from PySide6.QtGui import QPainter, QColor
 
 
 class AudioWorker(QObject):
     """Handles audio input processing and emits level signals."""
+
     level_changed = Signal(float)
     error_occurred = Signal(str)
 
@@ -47,7 +57,7 @@ class AudioWorker(QObject):
                 channels=1,
                 samplerate=44100,
                 blocksize=1024,
-                callback=self.audio_callback
+                callback=self.audio_callback,
             )
             self.stream.start()
             self.current_device = device_index
@@ -84,7 +94,7 @@ class LEDMeter(QWidget):
     def paintEvent(self, event):
         """Draw the LED segments."""
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         width = self.width()
         height = self.height()
@@ -96,13 +106,13 @@ class LEDMeter(QWidget):
 
             # Color gradient: green -> yellow -> red
             if i < self.segments * 0.6:
-                active_color = QColor(76, 175, 80)    # Green
+                active_color = QColor(76, 175, 80)  # Green
                 inactive_color = QColor(30, 70, 32)
             elif i < self.segments * 0.8:
-                active_color = QColor(255, 193, 7)    # Yellow
+                active_color = QColor(255, 193, 7)  # Yellow
                 inactive_color = QColor(100, 76, 3)
             else:
-                active_color = QColor(244, 67, 54)    # Red
+                active_color = QColor(244, 67, 54)  # Red
                 inactive_color = QColor(97, 27, 22)
 
             if i < active_segments:
@@ -110,7 +120,7 @@ class LEDMeter(QWidget):
             else:
                 painter.setBrush(inactive_color)
 
-            painter.setPen(Qt.NoPen)
+            painter.setPen(Qt.PenStyle.NoPen)
             painter.drawRoundedRect(int(x), 0, int(segment_width), height, 2, 2)
 
 
@@ -119,7 +129,7 @@ class MicrophoneTester(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.pulse = None
+        self.pulse: pulsectl.Pulse | None = None
         self.audio_worker = AudioWorker()
         self.source_list = []  # List of (pulse_source, sd_device_index)
 
@@ -131,14 +141,17 @@ class MicrophoneTester(QWidget):
     def init_pulse(self):
         """Initialize PulseAudio connection."""
         try:
-            self.pulse = pulsectl.Pulse('mic-tester')
+            self.pulse = pulsectl.Pulse("mic-tester")
         except Exception as e:
             self.show_error_and_exit(f"无法连接到 PulseAudio/PipeWire:\n{e}")
 
     def init_ui(self):
         """Set up the user interface."""
         self.setWindowTitle("Microphone Tester")
-        self.setFixedWidth(400)
+        # Increase window width by 20% (400 -> 480)
+        self.setFixedWidth(480)
+        # Disable maximize button
+        self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, False)
 
         layout = QVBoxLayout(self)
         layout.setSpacing(15)
@@ -165,7 +178,7 @@ class MicrophoneTester(QWidget):
         volume_label = QLabel("Input volume")
         volume_layout.addWidget(volume_label)
 
-        self.volume_slider = QSlider(Qt.Horizontal)
+        self.volume_slider = QSlider(Qt.Orientation.Horizontal)
         self.volume_slider.setRange(0, 100)
         self.volume_slider.setValue(50)
         volume_layout.addWidget(self.volume_slider, 1)
@@ -195,23 +208,29 @@ class MicrophoneTester(QWidget):
         self.mic_combo.clear()
 
         try:
+            pulse = self.pulse
+            if pulse is None:
+                self.show_error_and_exit("PulseAudio/PipeWire 未初始化")
+
             # Get PulseAudio sources
-            sources = self.pulse.source_list()
+            sources = pulse.source_list()
 
             # Get sounddevice devices for matching
             sd_devices = sd.query_devices()
 
             for source in sources:
                 # Skip monitor sources (they capture output, not input)
-                if 'monitor' in source.name.lower():
+                if "monitor" in source.name.lower():
                     continue
 
                 # Find matching sounddevice index
                 sd_index = None
                 for i, dev in enumerate(sd_devices):
-                    if dev['max_input_channels'] > 0:
+                    dev_info = cast(dict[str, Any], dev)
+                    if dev_info.get("max_input_channels", 0) > 0:
                         # Try to match by name
-                        if source.description in dev['name'] or source.name in dev['name']:
+                        name = str(dev_info.get("name", ""))
+                        if source.description in name or source.name in name:
                             sd_index = i
                             break
 
@@ -244,8 +263,11 @@ class MicrophoneTester(QWidget):
 
         # Update volume slider to reflect this source's volume
         try:
+            pulse = self.pulse
+            if pulse is None:
+                return
             # Refresh source info
-            sources = self.pulse.source_list()
+            sources = pulse.source_list()
             for s in sources:
                 if s.index == source.index:
                     volume_percent = int(s.volume.value_flat * 100)
@@ -271,10 +293,14 @@ class MicrophoneTester(QWidget):
 
         source, _ = self.source_list[index]
 
+        pulse = self.pulse
+        if pulse is None:
+            return
+
         try:
             # Set PulseAudio source volume
             volume = value / 100.0
-            self.pulse.volume_set_all_chans(source, volume)
+            pulse.volume_set_all_chans(source, volume)
         except Exception as e:
             print(f"Error setting volume: {e}")
 
@@ -312,7 +338,7 @@ class MicrophoneTester(QWidget):
 
 def main():
     app = QApplication(sys.argv)
-    app.setStyle('Fusion')
+    app.setStyle("Fusion")
 
     window = MicrophoneTester()
     window.show()
