@@ -14,6 +14,7 @@ import time
 import wave
 
 import pyaudio
+from textual import events
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import DataTable, Footer, Header, Input, Static
@@ -342,6 +343,8 @@ class DeviceSelectorApp(App):
         ("q", "quit", "Quit"),
         ("t", "test_device", "Test"),
         ("enter", "save_device", "Save"),
+        ("s", "save_device", "Save"),
+        ("ctrl+s", "save_device", "Save"),
     ]
 
     def __init__(self, **kwargs: Any) -> None:
@@ -378,9 +381,17 @@ class DeviceSelectorApp(App):
             yield Static("Ready", id="status")
         yield Footer()
 
+    def on_key(self, event: events.Key) -> None:
+        # Textual widgets (e.g. DataTable) may handle Enter internally.
+        # Make Enter a reliable "save" key unless the user is editing an Input.
+        if event.key == "enter" and not isinstance(self.focused, Input):
+            self.action_save_device()
+            event.stop()
+            return
+
     def on_mount(self) -> None:
         table = self.query_one(DataTable)
-        table.add_columns("Index", "Name", "Channels", "SampleRate", "Default")
+        table.add_columns("Index", "Name", "MaxInputChannels", "SampleRate", "Default")
         for device in self.devices:
             table.add_row(
                 str(device.index),
