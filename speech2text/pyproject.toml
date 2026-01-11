@@ -9,6 +9,7 @@ dependencies = [
     "openai>=1.0.0",
     "psutil>=5.9.0",
     "python-dotenv>=1.0.0",
+    "textual>=0.50.0",
 ]
 
 [build-system]
