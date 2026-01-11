@@ -6,6 +6,7 @@ Designed for Linux systems with PipeWire/PulseAudio.
 
 import os
 import sys
+from pathlib import Path
 from typing import Any, cast
 
 import numpy as np
@@ -17,13 +18,11 @@ from PySide6.QtWidgets import (
     QApplication,
     QWidget,
     QVBoxLayout,
-    QHBoxLayout,
     QComboBox,
     QPushButton,
-    QSlider,
-    QLabel,
     QMessageBox,
 )
+
 from PySide6.QtGui import QPainter, QColor
 
 
@@ -144,6 +143,8 @@ class MicrophoneTester(QWidget):
         self.audio_worker = AudioWorker()
         self.capture_device_index: int | None = None
         self.source_list = []  # List of (pulse_source, sd_device_index)
+        self.saved_pulse_source_name: str | None = None
+        self.env_pulse_source_present = False
 
         self.init_pulse()
         self.init_ui()
@@ -185,21 +186,10 @@ class MicrophoneTester(QWidget):
         self.led_meter.setMinimumHeight(24)
         layout.addWidget(self.led_meter)
 
-        # Input volume slider
-        volume_layout = QHBoxLayout()
-        volume_label = QLabel("Input volume")
-        volume_layout.addWidget(volume_label)
-
-        self.volume_slider = QSlider(Qt.Orientation.Horizontal)
-        self.volume_slider.setRange(0, 100)
-        self.volume_slider.setValue(50)
-        volume_layout.addWidget(self.volume_slider, 1)
-
-        self.volume_value_label = QLabel("50%")
-        self.volume_value_label.setFixedWidth(40)
-        volume_layout.addWidget(self.volume_value_label)
-
-        layout.addLayout(volume_layout)
+        # Save button (persist selection to .env for main.py)
+        self.save_button = QPushButton("Save")
+        self.save_button.setEnabled(False)
+        layout.addWidget(self.save_button)
 
         # Decay timer for LED meter
         self.decay_timer = QTimer()
@@ -237,9 +227,50 @@ class MicrophoneTester(QWidget):
     def connect_signals(self):
         """Connect signals and slots."""
         self.mic_combo.currentIndexChanged.connect(self.on_mic_changed)
-        self.volume_slider.valueChanged.connect(self.on_volume_changed)
+        self.save_button.clicked.connect(self.on_save_clicked)
         self.audio_worker.level_changed.connect(self.on_level_changed)
         self.audio_worker.error_occurred.connect(self.on_audio_error)
+
+    def get_saved_pulse_source_name(self) -> str | None:
+        env_path = Path(__file__).parent / ".env"
+        try:
+            return self.read_env_file(env_path).get("PULSE_SOURCE") or None
+        except Exception:
+            return None
+
+    def get_current_pulse_source_name(self) -> str | None:
+        index = self.mic_combo.currentIndex()
+        if index < 0 or index >= len(self.source_list):
+            return None
+        source, _ = self.source_list[index]
+        return source.name
+
+    def has_unsaved_changes(self) -> bool:
+        current = self.get_current_pulse_source_name()
+        if not self.env_pulse_source_present:
+            return bool(current)
+        return current != self.saved_pulse_source_name
+
+    def update_save_button_state(self) -> None:
+        self.save_button.setEnabled(self.has_unsaved_changes())
+
+    def save_current_selection(self) -> bool:
+        source_name = self.get_current_pulse_source_name()
+        if not source_name:
+            QMessageBox.warning(self, "提示", "请先选择一个麦克风")
+            return False
+
+        env_path = Path(__file__).parent / ".env"
+        try:
+            self.write_env_file(env_path, {"PULSE_SOURCE": source_name})
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"保存失败: {e}")
+            return False
+
+        self.saved_pulse_source_name = source_name
+        self.env_pulse_source_present = True
+        self.update_save_button_state()
+        return True
 
     def load_devices(self):
         """Load available microphone devices."""
@@ -269,15 +300,48 @@ class MicrophoneTester(QWidget):
             if not self.source_list:
                 self.show_error_and_exit("未找到可用的麦克风设备")
 
-            # Set initial volume from system
-            if self.source_list:
-                source = self.source_list[0][0]
-                volume_percent = int(source.volume.value_flat * 100)
-                self.volume_slider.setValue(volume_percent)
-                self.volume_value_label.setText(f"{volume_percent}%")
+            saved_source = self.get_saved_pulse_source_name()
+            self.saved_pulse_source_name = saved_source
+            self.env_pulse_source_present = saved_source is not None
+            if saved_source:
+                for i, (source, _) in enumerate(self.source_list):
+                    if source.name == saved_source:
+                        self.mic_combo.setCurrentIndex(i)
+                        break
+
+            self.update_save_button_state()
 
         except Exception as e:
             self.show_error_and_exit(f"加载设备列表失败:\n{e}")
+
+    def read_env_file(self, path: Path) -> dict[str, str]:
+        if not path.exists():
+            return {}
+        entries: dict[str, str] = {}
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if "=" not in stripped:
+                continue
+            key, value = stripped.split("=", 1)
+            entries[key.strip()] = value.strip().strip('"').strip("'")
+        return entries
+
+    def write_env_file(self, path: Path, updates: dict[str, str]) -> None:
+        existing = self.read_env_file(path)
+        existing.update(updates)
+
+        lines: list[str] = []
+        for key, value in existing.items():
+            lines.append(f"{key}={value}")
+
+        # Keep file ending with newline.
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def on_save_clicked(self) -> None:
+        if self.save_current_selection():
+            QMessageBox.information(self, "提示", "已保存到 .env (PULSE_SOURCE)")
 
     def on_mic_changed(self, index: int):
         """Handle microphone selection change."""
@@ -286,49 +350,11 @@ class MicrophoneTester(QWidget):
 
         source, sd_index = self.source_list[index]
 
-        # Update volume slider to reflect this source's volume
-        try:
-            pulse = self.pulse
-            if pulse is None:
-                return
-            # Refresh source info
-            sources = pulse.source_list()
-            for s in sources:
-                if s.index == source.index:
-                    volume_percent = int(s.volume.value_flat * 100)
-                    self.volume_slider.blockSignals(True)
-                    self.volume_slider.setValue(volume_percent)
-                    self.volume_slider.blockSignals(False)
-                    self.volume_value_label.setText(f"{volume_percent}%")
-                    break
-        except Exception as e:
-            print(f"Error updating volume: {e}")
-
         # Start audio stream. Prefer capturing via Pulse backend and bind to the
         # selected microphone using PULSE_SOURCE.
         self.audio_worker.start_stream(sd_index, pulse_source_name=source.name)
         self.decay_timer.start()
-
-    def on_volume_changed(self, value: int):
-        """Handle volume slider change - adjust system volume."""
-        self.volume_value_label.setText(f"{value}%")
-
-        index = self.mic_combo.currentIndex()
-        if index < 0 or index >= len(self.source_list):
-            return
-
-        source, _ = self.source_list[index]
-
-        pulse = self.pulse
-        if pulse is None:
-            return
-
-        try:
-            # Set PulseAudio source volume
-            volume = value / 100.0
-            pulse.volume_set_all_chans(source, volume)
-        except Exception as e:
-            print(f"Error setting volume: {e}")
+        self.update_save_button_state()
 
     def on_level_changed(self, level: float):
         """Handle audio level update from worker."""
@@ -355,6 +381,30 @@ class MicrophoneTester(QWidget):
 
     def closeEvent(self, event):
         """Clean up on window close."""
+        if self.has_unsaved_changes():
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle("未保存")
+            box.setText("当前麦克风选择尚未保存到 .env")
+            box.setInformativeText("是否保存后再退出？")
+
+            save_btn = box.addButton("保存并退出", QMessageBox.ButtonRole.AcceptRole)
+            discard_btn = box.addButton(
+                "不保存退出", QMessageBox.ButtonRole.DestructiveRole
+            )
+            box.addButton(QMessageBox.StandardButton.Cancel)
+
+            box.exec()
+            clicked = box.clickedButton()
+
+            if clicked == save_btn:
+                if not self.save_current_selection():
+                    event.ignore()
+                    return
+            elif clicked != discard_btn:
+                event.ignore()
+                return
+
         self.decay_timer.stop()
         self.audio_worker.stop_stream()
         if self.pulse:
@@ -369,9 +419,9 @@ def main():
     window = MicrophoneTester()
     window.show()
 
-    # Trigger initial device selection
+    # Trigger initial device selection (honor .env selection).
     if window.mic_combo.count() > 0:
-        window.on_mic_changed(0)
+        window.on_mic_changed(window.mic_combo.currentIndex())
 
     sys.exit(app.exec())
 

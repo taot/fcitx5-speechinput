@@ -44,6 +44,27 @@ def _safe_int(value: str | None) -> int | None:
         return None
 
 
+def _pick_pyaudio_pulse_input_device() -> int | None:
+    """Return PyAudio device index for PortAudio Pulse backend."""
+    try:
+        import pyaudio
+    except Exception:
+        return None
+
+    p = pyaudio.PyAudio()
+    try:
+        for index in range(p.get_device_count()):
+            info = p.get_device_info_by_index(index)
+            if int(info.get("maxInputChannels", 0)) <= 0:
+                continue
+            name = str(info.get("name", "")).lower()
+            if "pulse" in name:
+                return int(info.get("index", index))
+        return None
+    finally:
+        p.terminate()
+
+
 def send_text_via_dbus(text: str) -> None:
     """通过 dbus 将文字发送到 fcitx5"""
     subprocess.run(
@@ -74,10 +95,16 @@ def main() -> None:
     env_record_rate = _safe_int(os.getenv("RECORD_RATE"))
     env_record_channels = _safe_int(os.getenv("RECORD_CHANNELS"))
     env_record_chunk = _safe_int(os.getenv("RECORD_CHUNK"))
+    env_pulse_source = os.getenv("PULSE_SOURCE")
 
     device_index = (
         args.device_index if args.device_index is not None else env_device_index
     )
+
+    if device_index is None and env_pulse_source:
+        pulse_device = _pick_pyaudio_pulse_input_device()
+        if pulse_device is not None:
+            device_index = pulse_device
     record_rate = args.record_rate if args.record_rate is not None else env_record_rate
     record_channels = (
         args.record_channels
