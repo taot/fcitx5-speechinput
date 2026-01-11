@@ -1,22 +1,29 @@
 """语音输入主程序
 
 功能：
-1. 录音（支持信号停止、静音检测、超时）
+1. 录音（支持信号停止、超时）
 2. 使用 OpenAI Whisper 转文字
 3. 通过 dbus 将文字发送到 fcitx5
 
-停止录音：
-- 保持3秒静音
-- 达到60秒最大时长
-- 发送 SIGUSR1 信号: pkill -SIGUSR1 -f "python.*main.py"
+快捷键/停止：
+- 默认启用 toggle：如果已有实例在运行，再启动会发送 SIGUSR1 请求停止/取消
+- 录音阶段收到 SIGUSR1：结束录音并继续转写
+- 转写/发送阶段收到 SIGUSR1：取消整次流程并退出
+- 录音最长 60 秒兜底超时
 """
 
 from __future__ import annotations
 
 import argparse
+import atexit
 import os
+import signal
 import subprocess
+import sys
+import tempfile
 from pathlib import Path
+
+import fcntl
 
 from dotenv import load_dotenv
 
@@ -33,6 +40,102 @@ from transcriber import transcribe
 
 # 从 .env 文件加载环境变量
 load_dotenv(Path(__file__).parent / ".env")
+
+
+def _runtime_dir() -> Path:
+    xdg_runtime_dir = os.getenv("XDG_RUNTIME_DIR")
+    if xdg_runtime_dir:
+        return Path(xdg_runtime_dir)
+    return Path(tempfile.gettempdir())
+
+
+def _pidfile_path() -> Path:
+    return _runtime_dir() / "speech2text.pid"
+
+
+def _lockfile_path() -> Path:
+    return _runtime_dir() / "speech2text.lock"
+
+
+def _read_pidfile(pidfile: Path) -> int | None:
+    try:
+        text = pidfile.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def _is_process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    else:
+        return True
+
+
+def _is_our_process(pid: int) -> bool:
+    if not _is_process_alive(pid):
+        return False
+
+    cmdline_path = Path(f"/proc/{pid}/cmdline")
+    try:
+        cmdline = cmdline_path.read_bytes()
+    except OSError:
+        return True
+
+    script_path = str(Path(__file__).resolve()).encode("utf-8")
+    return script_path in cmdline
+
+
+def _write_pidfile(pidfile: Path, pid: int) -> None:
+    pidfile.write_text(f"{pid}\n", encoding="utf-8")
+
+
+def _cleanup_pidfile(pidfile: Path, pid: int) -> None:
+    existing_pid = _read_pidfile(pidfile)
+    if existing_pid != pid:
+        return
+    try:
+        pidfile.unlink()
+    except OSError:
+        pass
+
+
+def _maybe_toggle_or_exit(*, no_toggle: bool) -> None:
+    if no_toggle:
+        return
+
+    pidfile = _pidfile_path()
+    lockfile = _lockfile_path()
+
+    lockfile.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(lockfile, "w", encoding="utf-8") as lock_fp:
+        fcntl.flock(lock_fp, fcntl.LOCK_EX)
+
+        existing_pid = _read_pidfile(pidfile)
+        if existing_pid is not None and _is_our_process(existing_pid):
+            os.kill(existing_pid, signal.SIGUSR1)
+            raise SystemExit(0)
+
+        _write_pidfile(pidfile, os.getpid())
+
+    atexit.register(_cleanup_pidfile, pidfile, os.getpid())
+
+
+def _install_cancel_handler() -> None:
+    def _handle_cancel(signum, frame) -> None:
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGUSR1, _handle_cancel)
 
 
 def _safe_int(value: str | None) -> int | None:
@@ -81,6 +184,11 @@ def send_text_via_dbus(text: str) -> None:
 
 def build_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument(
+        "--no-toggle",
+        action="store_true",
+        help="Disable toggle mode; always start a new recording session.",
+    )
     parser.add_argument("--device-index", type=int, default=None)
     parser.add_argument("--record-rate", type=int, default=None)
     parser.add_argument("--record-channels", type=int, default=None)
@@ -90,6 +198,9 @@ def build_args() -> argparse.Namespace:
 
 def main() -> None:
     args = build_args()
+
+    _maybe_toggle_or_exit(no_toggle=args.no_toggle)
+    _install_cancel_handler()
 
     env_device_index = _safe_int(os.getenv("DEVICE_INDEX"))
     env_record_rate = _safe_int(os.getenv("RECORD_RATE"))
@@ -128,7 +239,7 @@ def main() -> None:
         temp_manager = TempFileManager()
         output_path = temp_manager.get_new_file_path()
 
-        notify_status("🎤 语音输入", "正在录音...\n3秒静音或1分钟后自动停止")
+        notify_status("🎤 语音输入", "正在录音...\n再按一次快捷键结束（最长60秒）")
 
         recorder = AudioRecorder(
             device_index=device_index,
@@ -141,7 +252,7 @@ def main() -> None:
             notify_status("🎤 语音输入", f"正在录音... {status}")
 
         audio_file, stop_reason = recorder.record(
-            output_path, progress_callback=on_progress
+            output_path, progress_callback=on_progress, stop_on_silence=False
         )
 
         stop_reason_text = {
@@ -165,6 +276,10 @@ def main() -> None:
         send_text_via_dbus(text)
 
         notify_status("🎤 语音输入", f"✓ 完成: {preview}", urgency="low")
+
+    except KeyboardInterrupt:
+        notify_status("🎤 语音输入", "已取消", urgency="low")
+        return
 
     except Exception as e:
         notify_status("🎤 语音输入", f"❌ 错误: {e}", urgency="critical")

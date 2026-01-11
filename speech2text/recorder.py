@@ -56,7 +56,13 @@ class AudioRecorder:
         samples = np.frombuffer(audio_chunk, dtype=np.int16)
         return np.abs(samples).mean() < self.SILENCE_THRESHOLD
 
-    def record(self, output_path: Path, progress_callback=None) -> tuple[Path, str]:
+    def record(
+        self,
+        output_path: Path,
+        *,
+        progress_callback=None,
+        stop_on_silence: bool = True,
+    ) -> tuple[Path, str]:
         """开始录音。
 
         Returns:
@@ -82,9 +88,12 @@ class AudioRecorder:
             )
 
             silence_chunks = 0
-            silence_chunks_threshold = int(
-                self.SILENCE_DURATION * self.rate / self.chunk
-            )
+            silence_chunks_threshold = 0
+            if stop_on_silence:
+                silence_chunks_threshold = int(
+                    self.SILENCE_DURATION * self.rate / self.chunk
+                )
+
             max_chunks = int(self.MAX_DURATION * self.rate / self.chunk)
 
             for i in range(max_chunks):
@@ -98,13 +107,14 @@ class AudioRecorder:
                 except Exception:
                     break
 
-                if self._is_silence(data):
-                    silence_chunks += 1
-                    if silence_chunks >= silence_chunks_threshold:
-                        stop_reason = "silence"
-                        break
-                else:
-                    silence_chunks = 0
+                if stop_on_silence:
+                    if self._is_silence(data):
+                        silence_chunks += 1
+                        if silence_chunks >= silence_chunks_threshold:
+                            stop_reason = "silence"
+                            break
+                    else:
+                        silence_chunks = 0
 
                 if progress_callback:
                     elapsed = (i + 1) * self.chunk / self.rate
