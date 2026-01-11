@@ -10,6 +10,8 @@ import argparse
 import subprocess
 import sys
 import tempfile
+import time
+import wave
 
 import pyaudio
 from textual.app import App, ComposeResult
@@ -146,6 +148,140 @@ def list_input_devices() -> list[DeviceInfo]:
     return devices
 
 
+def record_to_wav(
+    output_path: Path,
+    *,
+    device_index: int,
+    record_seconds: float,
+    record_rate: int,
+    record_channels: int,
+    record_chunk: int,
+) -> tuple[int, int]:
+    """Record audio to a WAV file.
+
+    Tries (channels, rate) from device-reported values first, then falls back.
+    Returns (wav_rate, chosen_channels).
+
+    WAV framerate is based on observed frames / wall time so playback duration
+    matches the recording duration more reliably.
+    """
+
+    p = pyaudio.PyAudio()
+    try:
+        max_input_channels: int | None = None
+        default_sample_rate: int | None = None
+        try:
+            info = p.get_device_info_by_index(device_index)
+            max_input_channels = int(info.get("maxInputChannels", 0))
+            default_sample_rate = int(float(info.get("defaultSampleRate", 0)))
+        except Exception:
+            pass
+
+        candidate_channels: list[int] = []
+        for channels in (record_channels, 2, 1):
+            if channels <= 0:
+                continue
+            if max_input_channels is not None and max_input_channels > 0:
+                if channels > max_input_channels:
+                    continue
+            if channels not in candidate_channels:
+                candidate_channels.append(channels)
+
+        candidate_rates: list[int] = []
+        for rate in (record_rate, default_sample_rate, 48000, 44100, 16000):
+            if rate is None or rate <= 0:
+                continue
+            if rate not in candidate_rates:
+                candidate_rates.append(rate)
+
+        stream = None
+        chosen_channels: int | None = None
+        chosen_rate: int | None = None
+        last_error: Exception | None = None
+
+        for channels in candidate_channels:
+            for rate in candidate_rates:
+                try:
+                    stream = p.open(
+                        format=pyaudio.paInt16,
+                        channels=channels,
+                        rate=rate,
+                        input=True,
+                        input_device_index=device_index,
+                        frames_per_buffer=record_chunk,
+                    )
+                    chosen_channels = channels
+                    chosen_rate = rate
+                    last_error = None
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    stream = None
+            if stream is not None:
+                break
+
+        if stream is None or chosen_channels is None or chosen_rate is None:
+            raise RuntimeError(
+                "Failed to open supported input stream "
+                f"(requested rate={record_rate}, channels={record_channels}): {last_error}"
+            )
+
+        frames: list[bytes] = []
+        total_frames = 0
+        start = time.monotonic()
+        try:
+            while (time.monotonic() - start) < record_seconds:
+                data = stream.read(record_chunk, exception_on_overflow=False)
+                frames.append(data)
+                # 16-bit samples -> 2 bytes per sample.
+                total_frames += len(data) // (2 * max(1, chosen_channels))
+        finally:
+            stream.stop_stream()
+            stream.close()
+
+        elapsed = max(0.001, time.monotonic() - start)
+        observed_rate = int(round(total_frames / elapsed))
+        wav_rate = observed_rate if observed_rate > 0 else chosen_rate
+
+        with wave.open(str(output_path), "wb") as wf:
+            wf.setnchannels(chosen_channels)
+            wf.setsampwidth(p.get_sample_size(pyaudio.paInt16))
+            wf.setframerate(wav_rate)
+            wf.writeframes(b"".join(frames))
+
+        return wav_rate, chosen_channels
+    finally:
+        p.terminate()
+
+
+def play_wav(
+    input_path: Path,
+    *,
+    record_chunk: int,
+) -> None:
+    p = pyaudio.PyAudio()
+    try:
+        with wave.open(str(input_path), "rb") as wf:
+            output = p.open(
+                format=p.get_format_from_width(wf.getsampwidth()),
+                channels=wf.getnchannels(),
+                rate=wf.getframerate(),
+                output=True,
+                frames_per_buffer=record_chunk,
+            )
+            try:
+                while True:
+                    data = wf.readframes(record_chunk)
+                    if not data:
+                        break
+                    output.write(data)
+            finally:
+                output.stop_stream()
+                output.close()
+    finally:
+        p.terminate()
+
+
 def record_and_playback(
     device_index: int,
     record_seconds: float,
@@ -153,39 +289,29 @@ def record_and_playback(
     record_channels: int,
     record_chunk: int,
 ) -> None:
-    p = pyaudio.PyAudio()
-    try:
-        frames: list[bytes] = []
-        stream = p.open(
-            format=pyaudio.paInt16,
-            channels=record_channels,
-            rate=record_rate,
-            input=True,
-            input_device_index=device_index,
-            frames_per_buffer=record_chunk,
-        )
-        try:
-            total_chunks = int(record_rate / record_chunk * record_seconds)
-            for _ in range(total_chunks):
-                frames.append(stream.read(record_chunk, exception_on_overflow=False))
-        finally:
-            stream.stop_stream()
-            stream.close()
+    with tempfile.NamedTemporaryFile(
+        mode="wb",
+        delete=False,
+        prefix="voice-input-device-test-",
+        suffix=".wav",
+    ) as wav_file:
+        wav_path = Path(wav_file.name)
 
-        output = p.open(
-            format=pyaudio.paInt16,
-            channels=record_channels,
-            rate=record_rate,
-            output=True,
+    try:
+        record_to_wav(
+            wav_path,
+            device_index=device_index,
+            record_seconds=record_seconds,
+            record_rate=record_rate,
+            record_channels=record_channels,
+            record_chunk=record_chunk,
         )
-        try:
-            for frame in frames:
-                output.write(frame)
-        finally:
-            output.stop_stream()
-            output.close()
+        play_wav(wav_path, record_chunk=record_chunk)
     finally:
-        p.terminate()
+        try:
+            wav_path.unlink()
+        except OSError:
+            pass
 
 
 class DeviceSelectorApp(App):
@@ -280,15 +406,19 @@ class DeviceSelectorApp(App):
         status = self.query_one("#status", Static)
         status.update(message)
 
-    def get_selected_device_index(self) -> int | None:
+    def get_selected_device(self) -> DeviceInfo | None:
         table = self.query_one(DataTable)
         if table.row_count == 0:
             return None
         if table.cursor_row is None:
             return None
         if 0 <= table.cursor_row < len(self.devices):
-            return self.devices[table.cursor_row].index
+            return self.devices[table.cursor_row]
         return None
+
+    def get_selected_device_index(self) -> int | None:
+        device = self.get_selected_device()
+        return device.index if device is not None else None
 
     def parse_record_config(self) -> RecordConfig | None:
         def parse_float(value: str) -> float:
@@ -313,22 +443,32 @@ class DeviceSelectorApp(App):
             return None
 
     def action_test_device(self) -> None:
-        device_index = self.get_selected_device_index()
-        if device_index is None:
+        device = self.get_selected_device()
+        if device is None:
             self.set_status("No device selected")
             return
+
         config = self.parse_record_config()
         if config is None:
             return
-        self.set_status(f"Recording {config.record_seconds:.1f} seconds...")
+
+        # For testing: use device-reported rate, and a safe channel count within
+        # the device capability. Some backends report very large max channel
+        # counts that are not actually openable.
+        config.record_rate = int(device.default_sample_rate)
+        config.record_channels = 2 if device.max_input_channels >= 2 else 1
+
+        self.set_status(
+            f"Recording {config.record_seconds:.1f}s @ {config.record_rate}Hz, {config.record_channels}ch (max={device.max_input_channels})..."
+        )
         self.run_worker(
-            lambda: self._test_device(device_index, config),
+            lambda: self._test_device(device.index, config),
             thread=True,
             exclusive=True,
         )
 
     def _test_device(self, device_index: int, config: RecordConfig) -> None:
-        # Run the audio test in a subprocess so any PortAudio/ALSA output or
+        # Run the audio test in subprocesses so any PortAudio/ALSA output or
         # crashes don't break Textual's terminal state.
         with tempfile.NamedTemporaryFile(
             mode="wb",
@@ -338,10 +478,17 @@ class DeviceSelectorApp(App):
         ) as log_file:
             log_path = Path(log_file.name)
 
-        cmd = [
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            delete=False,
+            prefix="voice-input-device-test-",
+            suffix=".wav",
+        ) as wav_file:
+            wav_path = Path(wav_file.name)
+
+        base_cmd = [
             sys.executable,
             str(Path(__file__)),
-            "--test",
             "--device-index",
             str(device_index),
             "--record-seconds",
@@ -355,20 +502,68 @@ class DeviceSelectorApp(App):
         ]
 
         try:
+            # 1) Record
+            record_cmd = [*base_cmd, "--record-to", str(wav_path)]
+            record_result = subprocess.run(
+                record_cmd, capture_output=True, text=True, check=False
+            )
             with log_path.open("ab") as log:
-                result = subprocess.run(cmd, stdout=log, stderr=log, check=False)
+                log.write(record_result.stdout.encode())
+                log.write(record_result.stderr.encode())
+                log.write(f"\n[record rc={record_result.returncode}]\n".encode())
+            if record_result.returncode != 0:
+                crash = record_result.returncode < 0 or record_result.returncode == 139
+                hint = " (signal/crash?)" if crash else ""
+                self.call_from_thread(
+                    self.set_status,
+                    f"Record failed (rc={record_result.returncode}){hint}, log: {log_path}",
+                )
+                return
+
+            used_format = ""
+            for line in record_result.stdout.splitlines():
+                if line.startswith("REC_OK"):
+                    used_format = line.removeprefix("REC_OK").strip()
+                    break
+
+            # 2) Playback
+            message = "Playing back..." + (f" ({used_format})" if used_format else "")
+            self.call_from_thread(self.set_status, message)
+            play_cmd = [
+                sys.executable,
+                str(Path(__file__)),
+                "--play-from",
+                str(wav_path),
+                "--record-chunk",
+                str(config.record_chunk),
+            ]
+            play_result = subprocess.run(
+                play_cmd, capture_output=True, text=True, check=False
+            )
+            with log_path.open("ab") as log:
+                log.write(play_result.stdout.encode())
+                log.write(play_result.stderr.encode())
+                log.write(f"\n[play rc={play_result.returncode}]\n".encode())
+            if play_result.returncode != 0:
+                hint = (
+                    " (signal/crash?)"
+                    if play_result.returncode < 0 or play_result.returncode == 139
+                    else ""
+                )
+                self.call_from_thread(
+                    self.set_status,
+                    f"Playback failed (rc={play_result.returncode}){hint}, log: {log_path}",
+                )
+                return
+
+            self.call_from_thread(self.set_status, "Playback complete")
         except Exception as exc:
             self.call_from_thread(self.set_status, f"Test failed: {exc}")
-            return
-
-        if result.returncode != 0:
-            self.call_from_thread(
-                self.set_status,
-                f"Test failed (rc={result.returncode}), log: {log_path}",
-            )
-            return
-
-        self.call_from_thread(self.set_status, "Playback complete")
+        finally:
+            try:
+                wav_path.unlink()
+            except OSError:
+                pass
 
     def action_save_device(self) -> None:
         device_index = self.get_selected_device_index()
@@ -395,12 +590,38 @@ def main() -> int:
     parser.add_argument(
         "--test", action="store_true", help="Run record/playback test and exit"
     )
+    parser.add_argument(
+        "--record-to", type=Path, default=None, help="Record to WAV and exit"
+    )
+    parser.add_argument(
+        "--play-from", type=Path, default=None, help="Play WAV and exit"
+    )
     parser.add_argument("--device-index", type=int, default=None)
     parser.add_argument("--record-seconds", type=float, default=3.0)
     parser.add_argument("--record-rate", type=int, default=44100)
     parser.add_argument("--record-channels", type=int, default=1)
     parser.add_argument("--record-chunk", type=int, default=1024)
     args = parser.parse_args()
+
+    if args.record_to is not None:
+        if args.device_index is None:
+            print("--device-index is required with --record-to")
+            return 2
+        wav_rate, wav_channels = record_to_wav(
+            args.record_to,
+            device_index=args.device_index,
+            record_seconds=args.record_seconds,
+            record_rate=args.record_rate,
+            record_channels=args.record_channels,
+            record_chunk=args.record_chunk,
+        )
+        print(f"REC_OK rate={wav_rate} channels={wav_channels}")
+        return 0
+
+    if args.play_from is not None:
+        play_wav(args.play_from, record_chunk=args.record_chunk)
+        print("PLAY_OK")
+        return 0
 
     if args.test:
         if args.device_index is None:
