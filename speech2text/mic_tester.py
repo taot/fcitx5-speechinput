@@ -4,6 +4,7 @@ Microphone Tester - A simple tool to test and adjust microphone input levels.
 Designed for Linux systems with PipeWire/PulseAudio.
 """
 
+import os
 import sys
 from typing import Any, cast
 
@@ -37,6 +38,7 @@ class AudioWorker(QObject):
         self.stream = None
         self.current_device = None
         self.gain = 1.0
+        self.pulse_source_name: str | None = None
 
     def audio_callback(self, indata, frames, time, status):
         """Called by sounddevice for each audio block."""
@@ -48,10 +50,19 @@ class AudioWorker(QObject):
         level = min(1.0, rms * self.gain * 4)
         self.level_changed.emit(level)
 
-    def start_stream(self, device_index: int):
+    def start_stream(self, device_index: int, *, pulse_source_name: str | None = None):
         """Start audio input stream for the specified device."""
         self.stop_stream()
+
+        if pulse_source_name is not None:
+            self.pulse_source_name = pulse_source_name
+
         try:
+            # When using PortAudio's PulseAudio backend, this controls
+            # which Pulse source the stream captures from.
+            if self.pulse_source_name:
+                os.environ["PULSE_SOURCE"] = self.pulse_source_name
+
             self.stream = sd.InputStream(
                 device=device_index,
                 channels=1,
@@ -131,6 +142,7 @@ class MicrophoneTester(QWidget):
         super().__init__()
         self.pulse: pulsectl.Pulse | None = None
         self.audio_worker = AudioWorker()
+        self.capture_device_index: int | None = None
         self.source_list = []  # List of (pulse_source, sd_device_index)
 
         self.init_pulse()
@@ -195,6 +207,33 @@ class MicrophoneTester(QWidget):
         self.decay_timer.timeout.connect(self.decay_level)
         self.current_level = 0.0
 
+    def find_capture_device_index(self) -> int:
+        """Pick a PortAudio input device suitable for Pulse/PipeWire."""
+        devices = sd.query_devices()
+
+        # Prefer PulseAudio backend when available.
+        for i, dev in enumerate(devices):
+            dev_info = cast(dict[str, Any], dev)
+            if dev_info.get("max_input_channels", 0) <= 0:
+                continue
+            name = str(dev_info.get("name", "")).lower()
+            if name == "pulse" or " pulse" in name or name.startswith("pulse"):
+                return i
+
+        # PipeWire backend sometimes shows up as "pipewire".
+        for i, dev in enumerate(devices):
+            dev_info = cast(dict[str, Any], dev)
+            if dev_info.get("max_input_channels", 0) <= 0:
+                continue
+            name = str(dev_info.get("name", "")).lower()
+            if "pipewire" in name:
+                return i
+
+        default_input = sd.default.device[0]
+        if default_input is None:
+            return 0
+        return int(default_input)
+
     def connect_signals(self):
         """Connect signals and slots."""
         self.mic_combo.currentIndexChanged.connect(self.on_mic_changed)
@@ -215,30 +254,16 @@ class MicrophoneTester(QWidget):
             # Get PulseAudio sources
             sources = pulse.source_list()
 
-            # Get sounddevice devices for matching
-            sd_devices = sd.query_devices()
+            # Use a single PortAudio backend device for capturing, and select
+            # the actual microphone via PULSE_SOURCE when possible.
+            self.capture_device_index = self.find_capture_device_index()
 
             for source in sources:
                 # Skip monitor sources (they capture output, not input)
                 if "monitor" in source.name.lower():
                     continue
 
-                # Find matching sounddevice index
-                sd_index = None
-                for i, dev in enumerate(sd_devices):
-                    dev_info = cast(dict[str, Any], dev)
-                    if dev_info.get("max_input_channels", 0) > 0:
-                        # Try to match by name
-                        name = str(dev_info.get("name", ""))
-                        if source.description in name or source.name in name:
-                            sd_index = i
-                            break
-
-                # If no exact match, use default input
-                if sd_index is None:
-                    sd_index = sd.default.device[0]
-
-                self.source_list.append((source, sd_index))
+                self.source_list.append((source, self.capture_device_index))
                 self.mic_combo.addItem(source.description)
 
             if not self.source_list:
@@ -279,8 +304,9 @@ class MicrophoneTester(QWidget):
         except Exception as e:
             print(f"Error updating volume: {e}")
 
-        # Start audio stream
-        self.audio_worker.start_stream(sd_index)
+        # Start audio stream. Prefer capturing via Pulse backend and bind to the
+        # selected microphone using PULSE_SOURCE.
+        self.audio_worker.start_stream(sd_index, pulse_source_name=source.name)
         self.decay_timer.start()
 
     def on_volume_changed(self, value: int):
