@@ -173,9 +173,9 @@ def send_text_via_dbus(text: str) -> None:
     subprocess.run(
         [
             "qdbus",
-            "org.fcitx.Fcitx5.SpeechBridge",
-            "/org/fcitx/Fcitx5/SpeechBridge",
-            "org.fcitx.Fcitx5.SpeechBridge1.SendText",
+            "org.fcitx.Fcitx5.DBusBridge",
+            "/org/fcitx/Fcitx5/DBusBridge",
+            "org.fcitx.Fcitx5.DBusBridge1.SendText",
             text,
         ],
         check=True,

@@ -1,4 +1,4 @@
-# fcitx5-speechbridge
+# fcitx5-dbus-bridge
 
 ## ChatGPT Threads
 
@@ -35,8 +35,8 @@ sudo cmake --install build
 安装后：
 
 ```
-/usr/lib/fcitx5/libspeechbridge.so
-/usr/share/fcitx5/addon/speechbridge.conf
+/usr/lib/fcitx5/libdbusbridge.so
+/usr/share/fcitx5/addon/dbusbridge.conf
 ```
 
 让 fcitx5 重新加载:
@@ -47,7 +47,7 @@ systemctl --user restart fcitx5-daemon.service
 
 启用 addon
 
-打开 fcitx5-configtool → Addons → 勾上 speechbridge（如果 OnDemand=False 通常会直接加载）。
+打开 fcitx5-configtool → Addons → 勾上 dbusbridge（如果 OnDemand=False 通常会直接加载）。
 但是在我的电脑上，无法勾选，安装上似乎就启用了
 
 ## 外部语音进程如何把文字“塞进输入框”
@@ -55,9 +55,9 @@ systemctl --user restart fcitx5-daemon.service
 用 qdbus 测试（KDE 自带，最快）
 
 ```
-qdbus org.fcitx.Fcitx5.SpeechBridge \
-  /org/fcitx/Fcitx5/SpeechBridge \
-  org.fcitx.Fcitx5.SpeechBridge1.SendText \
+qdbus org.fcitx.Fcitx5.DBusBridge \
+  /org/fcitx/Fcitx5/DBusBridge \
+  org.fcitx.Fcitx5.DBusBridge1.SendText \
   "你好，这是语音识别结果"
 ```
 
@@ -65,9 +65,9 @@ qdbus org.fcitx.Fcitx5.SpeechBridge \
 
 ```
 gdbus call --session \
-  --dest org.fcitx.Fcitx5.SpeechBridge \
-  --object-path /org/fcitx/Fcitx5/SpeechBridge \
-  --method org.fcitx.Fcitx5.SpeechBridge1.SendText \
+  --dest org.fcitx.Fcitx5.DBusBridge \
+  --object-path /org/fcitx/Fcitx5/DBusBridge \
+  --method org.fcitx.Fcitx5.DBusBridge1.SendText \
   "hello from gdbus"
 ```
 

@@ -16,19 +16,19 @@
 
 namespace {
 
-// 你外部语音进程要调用的 DBus 三件套
-constexpr const char *kServiceName   = "org.fcitx.Fcitx5.SpeechBridge";
-constexpr const char *kObjectPath    = "/org/fcitx/Fcitx5/SpeechBridge";
-constexpr const char *kInterfaceName = "org.fcitx.Fcitx5.SpeechBridge1";
+// 外部进程要调用的 DBus 三件套
+constexpr const char *kServiceName   = "org.fcitx.Fcitx5.DBusBridge";
+constexpr const char *kObjectPath    = "/org/fcitx/Fcitx5/DBusBridge";
+constexpr const char *kInterfaceName = "org.fcitx.Fcitx5.DBusBridge1";
 
 } // namespace
 
-class SpeechBridgeModule;
+class DBusBridgeModule;
 
 // DBus 对象：提供方法 SendText(string) -> bool
-class SpeechBridgeDBusObject : public fcitx::dbus::ObjectVTable<SpeechBridgeDBusObject> {
+class DBusBridgeDBusObject : public fcitx::dbus::ObjectVTable<DBusBridgeDBusObject> {
 public:
-    explicit SpeechBridgeDBusObject(SpeechBridgeModule *owner) : owner_(owner) {}
+    explicit DBusBridgeDBusObject(DBusBridgeModule *owner) : owner_(owner) {}
 
     // DBus: SendText(s) -> b
     bool SendText(const std::string &text);
@@ -40,13 +40,13 @@ public:
     FCITX_OBJECT_VTABLE_METHOD(SendText, "SendText", "s", "b");
 
 private:
-    SpeechBridgeModule *owner_;
+    DBusBridgeModule *owner_;
     void logSenderMetadata() const;
 };
 
-class SpeechBridgeModule : public fcitx::AddonInstance {
+class DBusBridgeModule : public fcitx::AddonInstance {
 public:
-    explicit SpeechBridgeModule(fcitx::Instance *instance)
+    explicit DBusBridgeModule(fcitx::Instance *instance)
         : instance_(instance),
           bus_(fcitx::dbus::BusType::Session),
           dbusObject_(this) {
@@ -55,7 +55,7 @@ public:
         bus_.attachEventLoop(&instance_->eventLoop());
 
         if (!bus_.isOpen()) {
-            FCITX_ERROR() << "SpeechBridge: DBus session bus is not open.";
+            FCITX_ERROR() << "DBusBridge: DBus session bus is not open.";
             return;
         }
 
@@ -63,24 +63,24 @@ public:
         if (!bus_.requestName(
                 kServiceName,
                 fcitx::Flags<fcitx::dbus::RequestNameFlag>{fcitx::dbus::RequestNameFlag::ReplaceExisting})) {
-            FCITX_ERROR() << "SpeechBridge: failed to request dbus name: " << kServiceName;
+            FCITX_ERROR() << "DBusBridge: failed to request dbus name: " << kServiceName;
             return;
         }
 
         // 注册对象与接口
         if (!bus_.addObjectVTable(kObjectPath, kInterfaceName, dbusObject_)) {
-            FCITX_ERROR() << "SpeechBridge: failed to addObjectVTable at " << kObjectPath;
+            FCITX_ERROR() << "DBusBridge: failed to addObjectVTable at " << kObjectPath;
             bus_.releaseName(kServiceName);
             return;
         }
 
-        FCITX_INFO() << "SpeechBridge: ready on DBus:"
+        FCITX_INFO() << "DBusBridge: ready on DBus:"
                      << " name=" << kServiceName
                      << " path=" << kObjectPath
                      << " iface=" << kInterfaceName;
     }
 
-    ~SpeechBridgeModule() override {
+    ~DBusBridgeModule() override {
         // 安全清理
         bus_.releaseName(kServiceName);
         bus_.detachEventLoop();
@@ -99,27 +99,27 @@ public:
         }
 
         if (!ic) {
-            FCITX_WARN() << "SpeechBridge: no input context available, drop text.";
+            FCITX_WARN() << "DBusBridge: no input context available, drop text.";
             return false;
         }
 
-        FCITX_INFO() << "SpeechBridge: commit text, len=" << text.size();
+        FCITX_INFO() << "DBusBridge: commit text, len=" << text.size();
         ic->commitString(text);
         return true;
     }
 
 private:
-    friend class SpeechBridgeDBusObject;
+    friend class DBusBridgeDBusObject;
 
     fcitx::Instance *instance_;
     fcitx::dbus::Bus bus_;
-    SpeechBridgeDBusObject dbusObject_;
+    DBusBridgeDBusObject dbusObject_;
 };
 
-void SpeechBridgeDBusObject::logSenderMetadata() const {
+void DBusBridgeDBusObject::logSenderMetadata() const {
     auto message = this->currentMessage();
     if (!message) {
-        FCITX_WARN() << "SpeechBridge: SendText invoked with no current message";
+        FCITX_WARN() << "DBusBridge: SendText invoked with no current message";
         return;
     }
 
@@ -143,14 +143,14 @@ void SpeechBridgeDBusObject::logSenderMetadata() const {
     // the sender bus name can be used to query credentials separately if needed.
 
     // Log all metadata in single line
-    FCITX_INFO() << "SpeechBridge SendText: sender=" << sender
+    FCITX_INFO() << "DBusBridge SendText: sender=" << sender
                  << " serial=" << serial
                  << " method=" << method
                  << " interface=" << interface
                  << " path=" << path;
 }
 
-bool SpeechBridgeDBusObject::SendText(const std::string &text) {
+bool DBusBridgeDBusObject::SendText(const std::string &text) {
     // DBus method 入口
     if (!owner_) {
         return false;
@@ -162,13 +162,13 @@ bool SpeechBridgeDBusObject::SendText(const std::string &text) {
 }
 
 // 工厂
-class SpeechBridgeFactory : public fcitx::AddonFactory {
+class DBusBridgeFactory : public fcitx::AddonFactory {
 public:
     fcitx::AddonInstance *create(fcitx::AddonManager *manager) override {
         auto *instance = manager->instance();
-        return new SpeechBridgeModule(instance);
+        return new DBusBridgeModule(instance);
     }
 };
 
 
-FCITX_ADDON_FACTORY(SpeechBridgeFactory);
+FCITX_ADDON_FACTORY(DBusBridgeFactory);
